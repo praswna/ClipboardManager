@@ -1,13 +1,3 @@
-"""
-Clipboard Manager v10.9
-- 세션 복원 / 최대 카드 수 제한 / 팝업 자동닫기 토글
-- 다이얼로그 커스텀 UI 적용 (다크 테마 타이틀바)
-- 이미지 그리기 및 텍스트 수정 시 Ctrl + 마우스 휠 크기 조절(Zoom) 지원
-- 텍스트 수정 시 '새 카드로 저장' 기능 지원 및 창 크기 조절 기능
-- 다이얼로그 바깥 영역 클릭 시 자동 닫기(즉각 포커스 아웃 반응)
-요구사항: pip install PyQt6
-"""
-
 import sys
 import os
 import datetime
@@ -1107,7 +1097,7 @@ class DrawingDialog(QDialog):
 
 
 # ── 클립보드 카드 ──────────────────────────────────────────────────────────────
-class ClipCard(QWidget):
+class ClipCard(QFrame):
     """저장된 클립보드 항목 하나를 나타내는 카드 위젯."""
 
     deleted = pyqtSignal(object)
@@ -1126,13 +1116,18 @@ class ClipCard(QWidget):
         meta: str = "",
     ):
         super().__init__()
+        self.setObjectName("clipCard")
         self.filepath = filepath
         self.mode = mode
         self.content_hash = ""
         self.pinned = False
         self._drag_start = None
         self.setFixedHeight(card_height)
-        self.setStyleSheet(f"background:{BG3}; border-radius:4px;")
+        
+        # ID 선택자를 사용하여 자식 위젯으로 스타일이 상속되지 않도록 제한합니다.
+        self._base_style = f"#clipCard {{ background:{BG3}; border-radius:4px; border:2px solid transparent; }}"
+        self._highlight_style = f"#clipCard {{ background:{BG3}; border-radius:4px; border:2px solid {ACCENT}; }}"
+        self.setStyleSheet(self._base_style)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
         row = QHBoxLayout(self)
@@ -1347,14 +1342,10 @@ class ClipCard(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start:
-            # 드래그가 아닌 제자리 클릭으로 판단되면 복사 실행
+            # 드래그가 아닌 제자리 클릭으로 판단되면 복사 + 붙여넣기 실행
             if (event.globalPosition().toPoint() - self._drag_start).manhattanLength() < 10:
                 self.request_copy.emit(self)
-                # 시각적 피드백 (배경색 살짝 깜빡임)
-                self.setStyleSheet(f"background:{LINE}; border-radius:4px;")
-                QTimer.singleShot(100, lambda: self.setStyleSheet(f"background:{BG3}; border-radius:4px;"))
         self._drag_start = None
-
 
 # ── 콘텐츠 팝업 ───────────────────────────────────────────────────────────────
 class ContentPopup(QWidget):
@@ -1366,7 +1357,9 @@ class ContentPopup(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus  # 팝업이 포커스를 빼앗지 않음
         )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)  # 활성화 없이 표시
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setStyleSheet(f"background:{BG};")
         self.cards: list[ClipCard] = []
@@ -1429,14 +1422,7 @@ class ContentPopup(QWidget):
         self.ac_btn.setIcon(make_pin_icon(14, checked))
 
     def changeEvent(self, event):
-        """포커스를 잃으면 자동으로 팝업을 숨긴다 (auto_close 활성 시)."""
-        if (
-            event.type() == QEvent.Type.ActivationChange
-            and not self.isActiveWindow()
-            and self.auto_close
-            and not self._just_shown
-        ):
-            QTimer.singleShot(150, self._maybe_hide)
+        """WindowDoesNotAcceptFocus 플래그로 포커스를 받지 않으므로 ActivationChange 미사용."""
         super().changeEvent(event)
 
     def _maybe_hide(self):
@@ -1444,21 +1430,24 @@ class ContentPopup(QWidget):
         top_window = QApplication.activeWindow()
         if isinstance(top_window, QDialog):
             return
-        if not self.isActiveWindow() and not self._just_shown:
+        if not self._just_shown:
             self._focus_poll.stop()
             self.hide()
 
     def _poll_focus(self):
-        """포커스가 팝업을 벗어났는지 주기적으로 감지하여 자동으로 숨긴다."""
+        """팝업 영역 밖을 클릭했는지 감지하여 자동으로 숨긴다.
+
+        WindowDoesNotAcceptFocus 플래그로 포커스를 받지 않으므로,
+        activeWindow 대신 마우스 버튼 상태 + 커서 위치로 닫기 여부를 판단한다.
+        """
         if not self.isVisible() or not self.auto_close:
             self._focus_poll.stop()
             return
         if self._just_shown:
             return
-        top_window = QApplication.activeWindow()
-        if isinstance(top_window, QDialog):
-            return
-        if top_window is not self:
+        # 마우스 버튼이 눌렸고 팝업 영역 밖이면 닫기
+        left_btn = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)  # VK_LBUTTON
+        if left_btn and not self.geometry().contains(QCursor.pos()):
             self._focus_poll.stop()
             self.hide()
 
@@ -1529,7 +1518,7 @@ class ContentPopup(QWidget):
                     break
 
     def show_at_cursor(self):
-        """현재 커서 위치를 기준으로 팝업을 표시한다."""
+        """현재 커서 위치를 기준으로 팝업을 표시한다. 기존 포커스는 유지된다."""
         pos = QCursor.pos()
         screen = QApplication.primaryScreen().availableGeometry()
         self._anchor_x = max(screen.left(), min(pos.x(), screen.right() - WIN_W))
@@ -1539,8 +1528,7 @@ class ContentPopup(QWidget):
         self._just_shown = True
         self.show()
         self.raise_()
-        _set_foreground_window(int(self.winId()))
-        self.activateWindow()
+        # activateWindow() 제거 — 포커스를 빼앗지 않음
         QTimer.singleShot(200, self._on_shown_settle)
 
     def _on_shown_settle(self):
@@ -1756,7 +1744,7 @@ class MainWindow(QMainWindow):
         self._build_ui_cards(root)
 
     def _make_trash_icon(self):
-        """휴지통 모양의 Clear All 버튼 아이콘을 생성한다."""
+        """휴지통 모양의 Clear All 버튼 아이콘 생성한다."""
         px = QPixmap(13, 13)
         px.fill(Qt.GlobalColor.transparent)
         p = QPainter(px)
@@ -1920,15 +1908,33 @@ class MainWindow(QMainWindow):
         self._caps_was_down = False
 
     def _poll_capslock(self):
-        """단축키 상태를 120ms 마다 폴링하여 팝업 표시/숨김을 토글한다."""
-        down = bool(ctypes.windll.user32.GetAsyncKeyState(self._hotkey_vk) & 0x8000)
-        if down and not self._caps_was_down:
+        """단축키 상태를 폴링하여 팝업 표시/숨김을 토글한다.
+
+        0x8000 비트: 현재 눌려있는지 여부
+        0x0001 비트: 마지막 호출 이후 눌렸다 떼진 적 있는지 여부 (빠른 입력 감지)
+        두 비트 중 하나라도 감지되면 토글 처리한다.
+        """
+        state = ctypes.windll.user32.GetAsyncKeyState(self._hotkey_vk)
+        currently_down = bool(state & 0x8000)
+        toggled_since_last = bool(state & 0x0001)
+
+        # 현재 눌림(엣지) 또는 폴링 사이에 눌렸다 떼진 경우 모두 처리
+        if (currently_down and not self._caps_was_down) or (toggled_since_last and not currently_down):
             self.popup.hide() if self.popup.isVisible() else self.popup.show_at_cursor()
-        self._caps_was_down = down
+
+        self._caps_was_down = currently_down
 
     def _on_card_copy_requested(self, card: ClipCard):
-        """카드의 복사 요청을 처리하여 클립보드에 내용을 설정한다."""
+        """카드의 복사 요청을 처리하여 클립보드에 설정하고 즉시 붙여넣기한다."""
         self._internal_copy_time = time.time()
+        
+        # 클릭된 항목(동일한 파일 경로)만 강조 표시를 유지하고, 나머지 카드의 강조 효과는 해제합니다.
+        for c in self.cards + self.popup.cards:
+            if c.filepath == card.filepath:
+                c.setStyleSheet(c._highlight_style)
+            else:
+                c.setStyleSheet(c._base_style)
+
         if card.mode == "image":
             px = QPixmap(card.filepath)
             if not px.isNull():
@@ -1939,6 +1945,45 @@ class MainWindow(QMainWindow):
                     self.clipboard.setText(f.read())
             except Exception:
                 pass
+                
+        # 팝업에서 클릭한 경우: 팝업을 닫지 않고 원래 포커스가 있던 창으로 Ctrl+V를 전송
+        if self.popup.isVisible():
+            QTimer.singleShot(120, self._send_paste)
+
+    def _send_paste(self):
+        """이전 포커스 창에 Ctrl+V 키 입력을 SendInput으로 전송한다."""
+
+        # INPUT 구조체 정의
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_ulong), ("ki", KEYBDINPUT)]
+
+        VK_CONTROL = 0x11
+        VK_V = 0x56
+        KEYEVENTF_KEYUP = 0x0002
+        INPUT_KEYBOARD = 1
+
+        def make_key(vk, flags=0):
+            i = INPUT()
+            i.type = INPUT_KEYBOARD
+            i.ki = KEYBDINPUT(vk, 0, flags, 0, None)
+            return i
+
+        inputs = (INPUT * 4)(
+            make_key(VK_CONTROL),            # Ctrl 누름
+            make_key(VK_V),                  # V 누름
+            make_key(VK_V, KEYEVENTF_KEYUP),        # V 뗌
+            make_key(VK_CONTROL, KEYEVENTF_KEYUP), # Ctrl 뗌
+        )
+        ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(INPUT))
 
     def _check_clipboard(self):
         """클립보드 변경을 감지하여 이미지/텍스트를 비동기 워커에 전달한다."""
