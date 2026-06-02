@@ -51,8 +51,8 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 class ClipWorker(QThread):
     """클립보드 데이터를 비동기로 파일에 저장하는 백그라운드 스레드."""
 
-    # 저장 성공 시: 모드, 해시, 파일 경로, 파일 이름, 메타, 데이터
-    finished_new = pyqtSignal(str, str, str, str, str, object)
+    # 저장 성공 시: 모드, 해시, 파일 경로, 파일 이름, 메타, 데이터, 썸네일데이터
+    finished_new = pyqtSignal(str, str, str, str, str, object, object)
     # 저장 실패 시: 콘텐츠 해시
     finished_err = pyqtSignal(str)
 
@@ -73,15 +73,23 @@ class ClipWorker(QThread):
                     f.write(self.data)
                 self.finished_new.emit(
                     "text", self.content_hash, fpath, fname,
-                    f"{len(self.data)}자", self.data,
+                    f"{len(self.data)}자", self.data, None
                 )
             elif self.mode == "image":
                 fname = datetime.datetime.now().strftime("clip_%Y%m%d_%H%M%S.png")
                 fpath = os.path.join(self.save_dir, fname)
                 self.data.save(fpath, "PNG")
+                
+                # 백그라운드에서 썸네일을 미리 생성하여 메인 UI 스레드의 부하를 줄임 (성능 개선)
+                thumb_img = self.data.scaled(
+                    200, CARD_HEIGHT_IMG - 8,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                
                 self.finished_new.emit(
                     "image", self.content_hash, fpath, fname,
-                    f"{self.data.width()}×{self.data.height()}", self.data,
+                    f"{self.data.width()}×{self.data.height()}", self.data, thumb_img
                 )
         except Exception:
             self.finished_err.emit(self.content_hash)
@@ -1114,6 +1122,7 @@ class ClipCard(QFrame):
         text_snippet: str = "",
         card_height: int = CARD_HEIGHT_IMG,
         meta: str = "",
+        thumb_px: QPixmap = None,
     ):
         super().__init__()
         self.setObjectName("clipCard")
@@ -1137,11 +1146,15 @@ class ClipCard(QFrame):
 
         if mode == "image" and pixmap:
             self.media = QLabel()
-            thumb = pixmap.scaled(
-                200, MEDIA_H,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            # 메인 스레드에서의 무거운 리사이징 연산 제거, 워커에서 넘겨준 썸네일 우선 사용
+            if thumb_px:
+                thumb = thumb_px
+            else:
+                thumb = pixmap.scaled(
+                    200, MEDIA_H,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
             self.media.setPixmap(thumb)
             self.media.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.media.setStyleSheet(f"background:{BG2}; border-radius:2px;")
@@ -1367,7 +1380,7 @@ class ToastItem(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
+            | Qt.WindowType.ToolTip  # Tool 대신 ToolTip을 사용하여 Windows OS의 강제 최소 높이 제약 회피
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -1385,10 +1398,14 @@ class ToastItem(QWidget):
         self._hide_timer.timeout.connect(self._on_timeout)
 
         self._build_ui(mode, text, pixmap)
+        
+        # High-DPI 배율 환경에서 setFixedHeight 사용 시 발생하는 경고를 피하기 위해
+        # 강제 고정 대신 1회에 한해서만 내용물에 맞춰 크기를 조절합니다.
         self.adjustSize()
 
     def _build_ui(self, mode, text, pixmap):
         root = QVBoxLayout(self)
+        root.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)  # 레이아웃 수준에서 크기 고정 강제
         root.setContentsMargins(10, 8, 10, 10)
         root.setSpacing(6)
 
@@ -1510,7 +1527,7 @@ class ToastManager:
         screen = QApplication.primaryScreen().availableGeometry()
         y = screen.bottom() - self.MARGIN
         for item in reversed(self._items):
-            item.adjustSize()
+            # item.adjustSize()  <-- 반복적인 사이즈 재계산을 방지하기 위해 삭제 (이미 고정됨)
             y -= item.height()
             x = screen.right() - item.width() - self.MARGIN
             item.move(x, y)
@@ -1540,6 +1557,8 @@ class ContentPopup(QWidget):
         self.auto_close = True
         self._anchor_x = 0
         self._anchor_y = 0
+        self._drag_pos = None
+        self._is_manually_moved = False  # 사용자가 직접 창을 옮겼는지 추적
         self._just_shown = False
         self._focus_poll = QTimer()
         self._focus_poll.timeout.connect(self._poll_focus)
@@ -1554,6 +1573,12 @@ class ContentPopup(QWidget):
         header = QWidget()
         header.setFixedHeight(28)
         header.setStyleSheet(f"background:{TITLE};")
+
+        # 팝업 상단(헤더)을 드래그하여 이동할 수 있도록 이벤트 연결
+        header.mousePressEvent = self._header_mouse_press
+        header.mouseMoveEvent = self._header_mouse_move
+        header.mouseReleaseEvent = self._header_mouse_release
+
         hl = QHBoxLayout(header)
         hl.setContentsMargins(10, 0, 6, 0)
         hl.addStretch()
@@ -1589,6 +1614,22 @@ class ContentPopup(QWidget):
         )
         self.scroll_area.setWidget(self.cards_container)
         root.addWidget(self.scroll_area)
+
+    def _header_mouse_press(self, e):
+        """헤더 드래그 시작"""
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def _header_mouse_move(self, e):
+        """헤더 드래그 중 창 이동"""
+        if e.buttons() == Qt.MouseButton.LeftButton and getattr(self, "_drag_pos", None):
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+
+    def _header_mouse_release(self, e):
+        """헤더 드래그 완료 시 수동 이동 상태 기록"""
+        if getattr(self, "_drag_pos", None):
+            self._drag_pos = None
+            self._is_manually_moved = True
 
     def _on_pin_toggled(self, checked):
         """핀 버튼 토글 시 자동 닫기 여부를 전환한다."""
@@ -1642,10 +1683,11 @@ class ContentPopup(QWidget):
         time_str=None,
         _resize=True,
         meta="",
+        thumb_px=None,
     ) -> ClipCard:
         """새 클립 카드를 팝업에 추가하고 필요 시 크기를 재조정한다."""
         ts = time_str or datetime.datetime.now().strftime("%H:%M:%S")
-        card = ClipCard(mode, fpath, fname, ts, pixmap, text_snippet, card_height, meta)
+        card = ClipCard(mode, fpath, fname, ts, pixmap, text_snippet, card_height, meta, thumb_px)
         card.deleted.connect(self._on_card_delete)
         card.pinned_changed.connect(self._on_pin_changed)
         pinned = sum(1 for c in self.cards if c.pinned)
@@ -1711,6 +1753,7 @@ class ContentPopup(QWidget):
         
         self._anchor_x = max(screen.left(), min(pos.x(), screen.right() - WIN_W))
         self._anchor_y = pos.y()
+        self._is_manually_moved = False  # 새 커서 위치에서 열리므로 수동 이동 플래그 초기화
         self._resize_popup()
         self._focus_poll.stop()
         self._just_shown = True
@@ -1727,34 +1770,50 @@ class ContentPopup(QWidget):
 
     def _resize_popup(self):
         """카드 수와 높이에 따라 팝업 창 크기를 동적으로 재계산한다.
-        커서 아래 공간이 부족하면 커서 위쪽으로 팝업을 표시한다."""
+        최대 3개의 카드 높이까지만 창이 커지고, 그 이상은 스크롤되도록 제한한다."""
         n = len(self.cards)
-        content_h = (
-            12 + sum(c.height() for c in self.cards) + (n - 1) * CARD_SPACING
-            if n > 0
-            else 40
-        )
+        visible_count = min(n, 3)
+        
+        if visible_count > 0:
+            visible_cards_h = sum(self.cards[i].height() for i in range(visible_count))
+            content_h = 12 + visible_cards_h + (visible_count - 1) * CARD_SPACING
+        else:
+            content_h = 40
+            
         ideal_h = content_h + 32
         
-        # 앵커 좌표가 위치한 모니터 화면의 영역을 가져옴
-        pos = QPoint(self._anchor_x, self._anchor_y)
-        screen_obj = QApplication.screenAt(pos) or QApplication.primaryScreen()
-        screen = screen_obj.availableGeometry()
-
-        space_below = screen.bottom() - self._anchor_y - 10
-        space_above = self._anchor_y - screen.top() - 10
-
-        if space_below >= min(ideal_h, 100) or space_below >= space_above:
-            # 커서 아래에 표시
-            popup_h = min(ideal_h, max(60, space_below))
-            popup_y = self._anchor_y
+        if self._is_manually_moved:
+            # 사용자가 수동으로 창을 옮긴 상태라면, 이동된 위치를 유지하며 크기만 변경
+            pos = self.pos()
+            screen_obj = QApplication.screenAt(pos) or QApplication.primaryScreen()
+            screen = screen_obj.availableGeometry()
+            
+            popup_h = min(ideal_h, screen.height() - 20)
+            self.resize(WIN_W, popup_h)
+            
+            # 내용물이 늘어나 창이 화면 아래로 벗어나면 위로 끌어올림
+            if self.y() + popup_h > screen.bottom() - 10:
+                self.move(self.x(), screen.bottom() - popup_h - 10)
         else:
-            # 커서 위에 표시 (아래 공간이 부족할 때)
-            popup_h = min(ideal_h, max(60, space_above))
-            popup_y = self._anchor_y - popup_h
+            # 앵커 좌표(최초 생성된 위치)가 위치한 모니터 화면의 영역을 가져옴
+            pos = QPoint(self._anchor_x, self._anchor_y)
+            screen_obj = QApplication.screenAt(pos) or QApplication.primaryScreen()
+            screen = screen_obj.availableGeometry()
 
-        self.resize(WIN_W, popup_h)
-        self.move(self._anchor_x, popup_y)
+            space_below = screen.bottom() - self._anchor_y - 10
+            space_above = self._anchor_y - screen.top() - 10
+
+            if space_below >= min(ideal_h, 100) or space_below >= space_above:
+                # 커서 아래에 표시
+                popup_h = min(ideal_h, max(60, space_below))
+                popup_y = self._anchor_y
+            else:
+                # 커서 위에 표시 (아래 공간이 부족할 때)
+                popup_h = min(ideal_h, max(60, space_above))
+                popup_y = self._anchor_y - popup_h
+
+            self.resize(WIN_W, popup_h)
+            self.move(self._anchor_x, popup_y)
 
 
 # ── 커스텀 타이틀바 ────────────────────────────────────────────────────────────
@@ -1890,13 +1949,17 @@ class MainWindow(QMainWindow):
         self._resize_window()
 
     def _resize_window(self):
-        """카드 합산 높이에 맞춰 메인 창을 재조정하고 오른쪽 하단에 배치한다."""
+        """카드 합산 높이에 맞춰 메인 창을 재조정하고 오른쪽 하단에 배치한다.
+        최대 3개의 카드 높이까지만 창이 커지고, 그 이상은 스크롤되도록 제한한다."""
         n = len(self.cards)
-        scroll_h = (
-            12 + sum(c.height() for c in self.cards) + (n - 1) * CARD_SPACING
-            if n > 0
-            else 20
-        )
+        visible_count = min(n, 3)
+        
+        if visible_count > 0:
+            visible_cards_h = sum(self.cards[i].height() for i in range(visible_count))
+            scroll_h = 12 + visible_cards_h + (visible_count - 1) * CARD_SPACING
+        else:
+            scroll_h = 20
+
         new_h = min(
             FIXED_H + scroll_h,
             QApplication.primaryScreen().availableGeometry().height() - 40,
@@ -2193,9 +2256,10 @@ class MainWindow(QMainWindow):
 
             if not img.isNull():
                 # 메인 스레드에서 즉시 해시를 계산하여 중복 감지 레이스 컨디션 완벽 차단
+                # (memoryview를 활용하여 불필요한 배열 복사 비용을 없애 성능 개선)
                 b = img.constBits()
                 b.setsize(img.sizeInBytes())
-                h = hashlib.md5(b.asarray()).hexdigest()
+                h = hashlib.md5(memoryview(b)).hexdigest()
 
                 # OS 캡처 도구의 지연된 중복 이벤트는 UI 업데이트 없이 즉시 무시 (1.5초 이내)
                 if (
@@ -2259,13 +2323,14 @@ class MainWindow(QMainWindow):
         )
         worker.start()
 
-    def _on_worker_new(self, mode, h, fpath, fname, meta, data):
+    def _on_worker_new(self, mode, h, fpath, fname, meta, data, thumb_data):
         """워커가 파일 저장을 완료하면 메인 창과 팝업에 카드를 추가하고 토스트를 띄운다."""
         self.current_filepath = fpath
         if mode == "image":
             px = QPixmap.fromImage(data)
-            self._add_card("image", fpath, fname, pixmap=px, card_height=CARD_HEIGHT_IMG, content_hash=h, meta=meta)
-            pop_card = self.popup.add_card("image", fpath, fname, pixmap=px, card_height=CARD_HEIGHT_IMG, meta=meta)
+            thumb_px = QPixmap.fromImage(thumb_data) if thumb_data else None
+            self._add_card("image", fpath, fname, pixmap=px, card_height=CARD_HEIGHT_IMG, content_hash=h, meta=meta, thumb_px=thumb_px)
+            pop_card = self.popup.add_card("image", fpath, fname, pixmap=px, card_height=CARD_HEIGHT_IMG, meta=meta, thumb_px=thumb_px)
             self.toast.show_image(px)
         else:
             al = data.splitlines()
@@ -2289,10 +2354,11 @@ class MainWindow(QMainWindow):
         content_hash="",
         _resize=True,
         meta="",
+        thumb_px=None,
     ) -> ClipCard:
         """메인 창 카드 목록에 새 ClipCard를 추가하고 레이아웃을 갱신한다."""
         ts = time_str or datetime.datetime.now().strftime("%H:%M:%S")
-        card = ClipCard(mode, fpath, fname, ts, pixmap, text_snippet, card_height, meta)
+        card = ClipCard(mode, fpath, fname, ts, pixmap, text_snippet, card_height, meta, thumb_px)
         card.content_hash = content_hash
         card.deleted.connect(self._on_card_delete)
         card.pinned_changed.connect(self._on_pin_changed)
