@@ -1331,9 +1331,40 @@ class ClipCard(QFrame):
             self.media.installEventFilter(self)
         self.media.setFixedHeight(MEDIA_H)
 
+        # ── 기본 라벨(IMG/TXT) 색상 지정 ──
+        base_badge_color = ACCENT if mode == "image" else "#3b82f6"  # IMG는 테일(Accent), TXT는 블루
+
+        # ── 데이터 크기에 따른 메타 라벨 색상(위험도) 결정 ──
+        meta_color = "#6b7280"  # 기본 메타 라벨 색상 (회색)
+        try:
+            if mode == "text" and meta.endswith("자"):
+                text_len = int(meta.replace(",", "").replace("자", ""))
+                if text_len >= 10000:
+                    meta_color = "#9333ea"   # 보라 (극도로 긺)
+                elif text_len >= 3000:
+                    meta_color = "#dc2626"   # 빨강 (매우 긺)
+                elif text_len >= 1000:
+                    meta_color = "#ea580c"   # 주황 (긺)
+                elif text_len >= 300:
+                    meta_color = "#ca8a04"   # 노랑 (조금 긺)
+            elif mode == "image" and "×" in meta:
+                w, h = map(int, meta.replace(",", "").split("×"))
+                pixels = w * h
+                if pixels >= 8294400:    # 약 4K 해상도 이상
+                    meta_color = "#9333ea"   # 보라 (극도로 큼)
+                elif pixels >= 3686400:  # 약 QHD 해상도 이상
+                    meta_color = "#dc2626"   # 빨강 (매우 큼)
+                elif pixels >= 2073600:  # 약 FHD 해상도 이상
+                    meta_color = "#ea580c"   # 주황 (큼)
+                elif pixels >= 1000000:  # 약 1000x1000 이상
+                    meta_color = "#ca8a04"   # 노랑 (조금 큼)
+        except Exception:
+            pass
+        # ──────────────────────────────────────────
+
         badge = QLabel("IMG" if mode == "image" else "TXT", self.media)
         badge.setStyleSheet(
-            f"background:{ACCENT if mode == 'image' else '#6b7280'}; color:white;"
+            f"background:{base_badge_color}; color:white;"
             f" font-size:10px; font-weight:bold; padding:1px 4px; border-radius:2px; border:none;"
         )
         badge.adjustSize()
@@ -1346,7 +1377,7 @@ class ClipCard(QFrame):
         if meta:
             meta_lbl = QLabel(meta, self.media)
             meta_lbl.setStyleSheet(
-                f"background:{ACCENT if mode == 'image' else '#6b7280'}; color:white;"
+                f"background:{meta_color}; color:white;"
                 f" font-size:10px; padding:1px 4px; border-radius:2px; border:none;"
             )
             meta_lbl.adjustSize()
@@ -1480,10 +1511,13 @@ class ClipCard(QFrame):
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     mime.setText(f.read())
+                # 텍스트 파일도 QUrl로 추가하여 파일 탐색기/바탕화면 등에 드롭 시 파일 복사 지원
+                mime.setUrls([QUrl.fromLocalFile(self.filepath)])
             except Exception:
                 pass
         else:
             mime.setUrls([QUrl.fromLocalFile(self.filepath)])
+            
         drag.setMimeData(mime)
         if self.mode == "image":
             px = QPixmap(self.filepath)
@@ -1495,6 +1529,7 @@ class ClipCard(QFrame):
                 )
                 drag.setPixmap(thumb)
                 drag.setHotSpot(QPoint(thumb.width() // 2, thumb.height() // 2))
+                
         drag.exec(Qt.DropAction.CopyAction)
         self._drag_start = None
 
@@ -1510,7 +1545,7 @@ class ToastItem(QWidget):
     """개별 토스트 알림 카드. 드래그로 내용을 복사할 수 있다."""
 
     TOAST_W = 260
-    MARGIN   = 8
+    MARGIN  = 8
     GAP      = 6
 
     closed = pyqtSignal(object)   # 닫힐 때 자신을 매니저에 알림
@@ -1888,7 +1923,7 @@ class ContentPopup(QWidget):
                     break
 
     def show_at_cursor(self):
-        """현재 커서 위치를 기준으로 팝업을 표시한다. 기존 포커스는 유지된다."""
+        """현재 커서 위치를 기준으로 팝업을 표시한다. 기존 포커 준 유지된다."""
         # 팝업을 열기 전 포커스를 가진 창의 HWND를 저장 → 붙여넣기 대상으로 사용
         self._prev_hwnd = ctypes.windll.user32.GetForegroundWindow()
         pos = QCursor.pos()
