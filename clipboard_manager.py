@@ -1984,14 +1984,28 @@ class ContentPopup(QWidget):
             space_below = screen.bottom() - self._anchor_y - 10
             space_above = self._anchor_y - screen.top() - 10
 
-            if space_below >= min(ideal_h, 100) or space_below >= space_above:
-                # 커서 아래에 표시
-                popup_h = min(ideal_h, max(60, space_below))
+            # 팝업이 화면 안에 완전히 들어올 수 있는 최대 높이로 제한
+            popup_h = min(ideal_h, screen.height() - 20)
+
+            CURSOR_GAP = 45  # 커서 위로 띄울 때 포인터 위 여백
+
+            if self._anchor_y + popup_h <= screen.bottom() - 10:
+                # 커서 아래에 완전히 들어감 → 아래 표시
                 popup_y = self._anchor_y
+            elif self._anchor_y - CURSOR_GAP - popup_h >= screen.top() + 10:
+                # 위에 완전히 들어감 → 커서에서 CURSOR_GAP 위에 표시
+                popup_y = self._anchor_y - CURSOR_GAP - popup_h
             else:
-                # 커서 위에 표시 (아래 공간이 부족할 때)
-                popup_h = min(ideal_h, max(60, space_above))
-                popup_y = self._anchor_y - popup_h
+                # 위아래 모두 공간 부족 → 더 넓은 쪽에 맞춰 높이 축소
+                if space_below >= space_above - CURSOR_GAP:
+                    popup_h = max(60, space_below)
+                    popup_y = self._anchor_y
+                else:
+                    popup_h = max(60, space_above - CURSOR_GAP)
+                    popup_y = self._anchor_y - CURSOR_GAP - popup_h
+
+            # 최종 보정: 어떤 경우에도 화면 밖으로 나가지 않도록 클램프
+            popup_y = max(screen.top() + 10, min(popup_y, screen.bottom() - popup_h - 10))
 
             self.resize(WIN_W, popup_h)
             self.move(self._anchor_x, popup_y)
